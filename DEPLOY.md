@@ -337,7 +337,7 @@ matter of months if nothing is pruned. Know what grows:
 
 | Table | What it is | Footprint |
 |---|---|---|
-| `events_YYYYMM` | every raw event, one partition per UTC month, 8 indexes each | ≈ 0.8 KB per row **including indexes**. A pageview produces 2–5 rows: the pageview, one `page_leave`, and periodic `page_pulse` behavior heartbeats. Bot traffic on a test site is often the majority of rows. |
+| `events_YYYYMM` | every raw event, one partition per UTC month, 6 indexes each (0022 dropped two unused ones) | ≈ 0.7 KB per row **including indexes**. A pageview produces 2–5 rows: the pageview, one `page_leave`, and periodic `page_pulse` behavior heartbeats. Bot traffic on a test site is often the majority of rows. |
 | `sessions` | one row per visit | ≈ 0.4 KB |
 | `visitor_profiles` | one row per visitor id ever seen (cross-visit scoring) | ≈ 0.3 KB — grows forever without pruning |
 | `rollup_*` | the pre-aggregated numbers the dashboards read | tiny; **kept forever** |

@@ -16,6 +16,14 @@
  * the rare case an ack is lost AFTER a successful commit they could over-count
  * on redelivery — a bounded residual, full session-table exactly-once is M2.
  *
+ * Write amplification: a queue batch (≤50 events) holds whole pages of one
+ * visitor (the SDK flushes a page's pv/pulse/leave together), so the
+ * session/identity/profile upserts are emitted ONE PER DISTINCT KEY PER
+ * BATCH with folded counters — not one per event. The fold reproduces the
+ * state the old per-event sequence would have left, including for a session
+ * the batch itself creates (the INSERT side carries the folded totals). In
+ * D1 each upserted row is a row written, so this is roughly −1.5 rows/event.
+ *
  * Keep the queue's max_batch_size modest (see wrangler.toml) so one batch's
  * statements fit comfortably in a single D1 batch().
  */
@@ -85,14 +93,31 @@ export default {
       await ensureThresholds(env.DB, rows.map((r) => r.site_id));
 
       // 2. ONE atomic D1 batch: event inserts (OR IGNORE) + session/identity/
-      //    profile upserts. All-or-nothing, so a retry can't partial-commit.
+      //    profile upserts, ONE PER DISTINCT KEY (events of the same session
+      //    cluster inside a queue batch). All-or-nothing, so a retry can't
+      //    partial-commit.
+      //
+      //    ts-ordered once here: every fold below assumes the group is in
+      //    application order, matching the per-event sequence it replaces.
+      const ordered = [...rows].sort((a, b) => a.ts - b.ts);
       const stmts: D1PreparedStatement[] = [];
-      for (const row of rows) {
+      for (const row of ordered) {
         stmts.push(env.DB.prepare(eventInsertSQL(monthSuffix(row.ts))).bind(...bindable(eventRowValues(row))));
-        stmts.push(sessionUpsert(env.DB, row, siteEngagedMs.get(row.site_id) ?? DEFAULT_ENGAGED_MS));
-        const identity = identityUpsert(env.DB, row);
-        if (identity) stmts.push(identity);
-        stmts.push(profileUpsert(env.DB, row));
+      }
+      const sessionGroups = groupBy(ordered, (r) => `${r.site_id}|${r.session_id}`);
+      const visitorGroups = groupBy(ordered, (r) => `${r.site_id}|${r.visitor_id}`);
+      const identityGroups = groupBy(
+        ordered.filter((r) => r.user_id),
+        (r) => `${r.site_id}|${r.user_id}|${r.visitor_id}`,
+      );
+      for (const evs of sessionGroups.values()) {
+        stmts.push(sessionUpsert(env.DB, evs, siteEngagedMs.get(evs[0].site_id) ?? DEFAULT_ENGAGED_MS));
+      }
+      for (const evs of visitorGroups.values()) {
+        stmts.push(profileUpsert(env.DB, evs));
+      }
+      for (const evs of identityGroups.values()) {
+        stmts.push(identityUpsert(env.DB, evs));
       }
       await env.DB.batch(stmts);
 
@@ -117,18 +142,61 @@ function bindable(values: unknown[]): unknown[] {
 }
 
 // ---------------------------------------------------------------------------
-// sessions: incremental upsert (§3, §9.2). Attribution/entry fields are set
-// on first insert only; counters accumulate; verdict tracks the worst score.
+// Fold helpers — reduce a ts-ordered group to the parameters ONE upsert
+// needs, equivalent to applying the old per-event statement sequence over
+// the group in order.
 // ---------------------------------------------------------------------------
 
-function sessionUpsert(db: D1Database, row: EventRow, engagedMs: number): D1PreparedStatement {
-  const isPageview = row.event === 'pageview' ? 1 : 0;
-  // a custom (goal) event is an engagement signal; identify/lifecycle events are not
-  const isCustom = isConversion(row.event) ? 1 : 0;
-  const duration = row.duration_ms ?? 0;
+function groupBy<T>(rows: T[], key: (row: T) => string): Map<string, T[]> {
+  const groups = new Map<string, T[]>();
+  for (const row of rows) {
+    const k = key(row);
+    const arr = groups.get(k);
+    if (arr) arr.push(row); else groups.set(k, [row]);
+  }
+  return groups;
+}
+
+/** First row attaining the group's max bot_score. Ties keep the earliest —
+ *  matching the strict > in the verdict CASE, which lets the existing verdict
+ *  survive an equal-score later event. */
+function worstRow(rows: EventRow[]): EventRow {
+  return rows.reduce((worst, r) => (r.bot_score > worst.bot_score ? r : worst), rows[0]);
+}
+
+/** Last non-null value in application order — exactly what the per-event
+ *  COALESCE(excluded.x, existing.x) chain applied in sequence leaves behind. */
+function lastNonNull<T>(rows: EventRow[], pick: (r: EventRow) => T | null | undefined): T | null {
+  let v: T | null = null;
+  for (const r of rows) {
+    const x = pick(r);
+    if (x != null) v = x;
+  }
+  return v;
+}
+
+// ---------------------------------------------------------------------------
+// sessions: incremental upsert (§3, §9.2), one per distinct (site, session)
+// per queue batch. Attribution/entry fields come from the FIRST event (they
+// are set on insert only); counters/exit fields are the fold of the group —
+// so a session this batch itself creates lands in its final state in one
+// statement instead of insert-then-N-updates.
+// ---------------------------------------------------------------------------
+
+function sessionUpsert(db: D1Database, rows: EventRow[], engagedMs: number): D1PreparedStatement {
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  const pageviews = rows.reduce((n, r) => n + (r.event === 'pageview' ? 1 : 0), 0);
+  let lastPv: EventRow | null = null;
+  for (const r of rows) if (r.event === 'pageview') lastPv = r;
   // periodic behavior carriers accumulate dwell/flags but are NOT counted as
   // activity: events_count keeps meaning "things the visitor did"
-  const counted = row.event === 'page_pulse' ? 0 : 1;
+  const counted = rows.reduce((n, r) => n + (r.event === 'page_pulse' ? 0 : 1), 0);
+  const duration = rows.reduce((n, r) => n + (r.duration_ms ?? 0), 0);
+  // a custom (goal) event is an engagement signal; identify/lifecycle events are not
+  const anyConversion = rows.some((r) => isConversion(r.event)) ? 1 : 0;
+  const hadInteraction = rows.reduce((m, r) => Math.max(m, r.had_interaction), 0);
+  const worst = worstRow(rows);
 
   return db.prepare(`
     INSERT INTO sessions (
@@ -137,13 +205,13 @@ function sessionUpsert(db: D1Database, row: EventRow, engagedMs: number): D1Prep
       had_interaction, had_pointer, is_bounce,
       source, medium, campaign, referrer, country, device_type,
       bot_score, verdict, bot_flags, started_at, last_active_at, last_pageview_at, channel
-    ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?21, ?6, ?25, ?7, ?8, ?26, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?19, ?23, ?24)
+    ) VALUES (?1, ?2, ?3, ?4, ?5, ?27, ?21, ?6, ?25, ?7, ?8, ?26, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?28, ?23, ?24)
     ON CONFLICT(site_id, session_id) DO UPDATE SET
       user_id         = COALESCE(excluded.user_id, sessions.user_id),
-      exit_page       = CASE WHEN ?6 = 1 THEN excluded.exit_page ELSE sessions.exit_page END,
+      exit_page       = CASE WHEN ?6 >= 1 THEN excluded.exit_page ELSE sessions.exit_page END,
       -- Plausible/UA visit duration = last_pageview_at − started_at; only
-      -- pageview events (?6 = 1) advance the last-pageview clock
-      last_pageview_at = CASE WHEN ?6 = 1 THEN MAX(COALESCE(sessions.last_pageview_at, 0), ?19) ELSE sessions.last_pageview_at END,
+      -- pageview events advance the last-pageview clock
+      last_pageview_at = CASE WHEN ?6 >= 1 THEN MAX(COALESCE(sessions.last_pageview_at, 0), ?23) ELSE sessions.last_pageview_at END,
       pageviews       = sessions.pageviews + ?6,
       events_count    = sessions.events_count + ?25,
       -- clamped: a backgrounded tab keeps sending page_pulse, which kept
@@ -174,67 +242,77 @@ function sessionUpsert(db: D1Database, row: EventRow, engagedMs: number): D1Prep
                              THEN excluded.verdict ELSE sessions.verdict END,
       last_active_at  = MAX(sessions.last_active_at, excluded.last_active_at)
   `).bind(
-    row.session_id,                                   // 1
-    row.site_id,                                      // 2
-    row.visitor_id,                                   // 3
-    row.user_id,                                      // 4
-    row.path,                                         // 5 entry/exit page
-    isPageview,                                       // 6
-    duration,                                         // 7
-    row.had_interaction,                              // 8
-    isCustom || duration >= engagedMs ? 0 : 1,        // 9 initial is_bounce
-    row.utm_source ?? row.ref_domain,                 // 10 source (utm first, else referrer domain)
-    row.utm_medium,                                   // 11
-    row.utm_campaign,                                 // 12
-    row.referrer,                                     // 13
-    row.country,                                      // 14
-    row.device_type,                                  // 15
-    row.bot_score,                                    // 16
-    row.verdict,                                      // 17
-    row.bot_flags,                                    // 18
-    row.ts,                                           // 19 started_at / last_active_at
-    isCustom,                                         // 20
-    row.hostname,                                     // 21 entry_host (kept from first event)
-    engagedMs,                                        // 22 per-site engaged dwell threshold
-    isPageview ? row.ts : null,                       // 23 last_pageview_at (pageview events only)
+    first.session_id,                                     // 1
+    first.site_id,                                        // 2
+    first.visitor_id,                                     // 3
+    lastNonNull(rows, (r) => r.user_id),                  // 4 user_id: last non-null
+    first.path,                                           // 5 entry page (first event)
+    pageviews,                                            // 6
+    duration,                                             // 7
+    hadInteraction,                                       // 8
+    // folded initial bounce: the per-event sequence zeroes it once cumulative
+    // pageviews ≥ 2, cumulative dwell ≥ threshold, or any custom event — a
+    // session this batch creates must INSERT its final state directly
+    pageviews >= 2 || anyConversion === 1 || duration >= engagedMs ? 0 : 1, // 9
+    first.utm_source ?? first.ref_domain,                 // 10 source (utm first, else referrer domain)
+    first.utm_medium,                                     // 11
+    first.utm_campaign,                                   // 12
+    first.referrer,                                       // 13
+    first.country,                                        // 14
+    first.device_type,                                    // 15
+    worst.bot_score,                                      // 16
+    worst.verdict,                                        // 17
+    rows.reduce((f, r) => f | r.bot_flags, 0),            // 18
+    first.ts,                                             // 19 started_at
+    anyConversion,                                        // 20
+    first.hostname,                                       // 21 entry_host (kept from first event)
+    engagedMs,                                            // 22 per-site engaged dwell threshold
+    lastPv ? lastPv.ts : null,                            // 23 last_pageview_at (pageview events only)
     // 24 channel — attribution is session-level, set on first insert only
     classifyChannel({
-      refDomain: row.ref_domain, utmSource: row.utm_source,
-      utmMedium: row.utm_medium, clickIdType: row.click_id_type,
+      refDomain: first.ref_domain, utmSource: first.utm_source,
+      utmMedium: first.utm_medium, clickIdType: first.click_id_type,
     }),
-    counted,                                          // 25 events_count increment
-    row.had_pointer,                                  // 26 pointer/keyboard only (NULL = old loader)
+    counted,                                              // 25 events_count increment
+    // 26 tri-state pointer/keyboard: NULL only if no event ever reported it
+    rows.every((r) => r.had_pointer == null) ? null : (rows.some((r) => r.had_pointer === 1) ? 1 : 0),
+    lastPv ? lastPv.path : first.path,                    // 27 exit page (last pageview)
+    last.ts,                                              // 28 last_active_at
   );
 }
 
 // ---------------------------------------------------------------------------
-// identities: user ↔ visitor map, only when the event carries a user_id (§3)
+// identities: user ↔ visitor map, one upsert per distinct (site, user,
+// visitor) per batch — only for events that carry a user_id (§3)
 // ---------------------------------------------------------------------------
 
-function identityUpsert(db: D1Database, row: EventRow): D1PreparedStatement | null {
-  if (!row.user_id) return null;
+function identityUpsert(db: D1Database, rows: EventRow[]): D1PreparedStatement {
   return db.prepare(`
     INSERT INTO identities (site_id, user_id, visitor_id, traits, first_seen, last_seen)
-    VALUES (?1, ?2, ?3, NULL, ?4, ?4)
+    VALUES (?1, ?2, ?3, NULL, ?4, ?5)
     ON CONFLICT(site_id, user_id, visitor_id) DO UPDATE SET
       last_seen = MAX(identities.last_seen, excluded.last_seen)
-  `).bind(row.site_id, row.user_id, row.visitor_id, row.ts);
+  `).bind(rows[0].site_id, rows[0].user_id, rows[0].visitor_id, rows[0].ts, rows[rows.length - 1].ts);
 }
 
 // ---------------------------------------------------------------------------
-// visitor_profiles: cheap incremental fields only. sessions_count and the
-// Welford interval stats (interval_mean/m2/cv, active_hours) are maintained
-// by the batch layer (§6.5, M2) — not double-counted here.
+// visitor_profiles: cheap incremental fields only, one per distinct visitor
+// per batch. sessions_count and the Welford interval stats (interval_mean/
+// m2/cv, active_hours) are maintained by the batch layer (§6.5, M2) — not
+// double-counted here.
 // ---------------------------------------------------------------------------
 
-function profileUpsert(db: D1Database, row: EventRow): D1PreparedStatement {
+function profileUpsert(db: D1Database, rows: EventRow[]): D1PreparedStatement {
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  const worst = worstRow(rows);
   // pulses keep the profile's last_seen fresh but don't inflate events_count
-  const counted = row.event === 'page_pulse' ? 0 : 1;
+  const counted = rows.reduce((n, r) => n + (r.event === 'page_pulse' ? 0 : 1), 0);
   return db.prepare(`
     INSERT INTO visitor_profiles (
       site_id, visitor_id, events_count, sessions_count,
       fp_hash, ip24_hash, asn, bot_score, verdict, first_seen, last_seen
-    ) VALUES (?1, ?2, ?9, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+    ) VALUES (?1, ?2, ?9, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?10)
     ON CONFLICT(site_id, visitor_id) DO UPDATE SET
       events_count = visitor_profiles.events_count + ?9,
       fp_hash      = COALESCE(excluded.fp_hash, visitor_profiles.fp_hash),
@@ -246,9 +324,13 @@ function profileUpsert(db: D1Database, row: EventRow): D1PreparedStatement {
       first_seen   = MIN(visitor_profiles.first_seen, excluded.first_seen),
       last_seen    = MAX(visitor_profiles.last_seen, excluded.last_seen)
   `).bind(
-    row.site_id, row.visitor_id,
-    row.fp_hash, row.ip24_hash, row.asn,
-    row.bot_score, row.verdict, row.ts,
+    first.site_id, first.visitor_id,
+    lastNonNull(rows, (r) => r.fp_hash),
+    lastNonNull(rows, (r) => r.ip24_hash),
+    lastNonNull(rows, (r) => r.asn),
+    worst.bot_score, worst.verdict,
+    first.ts,
     counted,
+    last.ts,
   );
 }

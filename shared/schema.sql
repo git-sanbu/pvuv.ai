@@ -110,10 +110,10 @@ CREATE UNIQUE INDEX idx_ev202607_eid ON events_202607(eid);
 CREATE INDEX idx_ev202607_site_ts ON events_202607(site_id, ts);
 CREATE INDEX idx_ev202607_site_ev_ts ON events_202607(site_id, event, ts);
 CREATE INDEX idx_ev202607_visitor ON events_202607(site_id, visitor_id);
-CREATE INDEX idx_ev202607_session ON events_202607(session_id);
 CREATE INDEX idx_ev202607_verdict ON events_202607(site_id, verdict, ts);
 CREATE INDEX idx_ev202607_path    ON events_202607(site_id, path);
-CREATE INDEX idx_ev202607_botcat ON events_202607(site_id, bot_category, ts);
+-- idx_ev202607_session / idx_ev202607_botcat dropped in 0022: no query uses
+-- them, and in D1 every index costs one row written per event.
 
 -- sessions
 CREATE TABLE sessions (

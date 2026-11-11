@@ -139,8 +139,9 @@ export async function runRetentionPurge(env: { DB: D1Database }, now = Date.now(
 // footprints (table + its 8 indexes); the exact number is `wrangler d1 info`.
 // ---------------------------------------------------------------------------
 
-/** Measured on the local reference dataset: bytes per row including indexes. */
-export const ROW_BYTES = { event: 780, session: 370, profile: 275 } as const;
+/** Measured on the local reference dataset: bytes per row including indexes
+ * (events: table + its 6 indexes — was 780 with the two 0022-dropped ones). */
+export const ROW_BYTES = { event: 700, session: 370, profile: 275 } as const;
 
 export interface StorageReport {
   partitions: Array<{ table: string; rows: number; pulse_rows: number; bot_rows: number; est_mb: number }>;

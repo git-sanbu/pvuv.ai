@@ -224,12 +224,23 @@ export function eventsIndexDDL(suffix: string): string[] {
     // covers the ubiquitous site_id + event='pageview' + ts-range scans
     `CREATE INDEX IF NOT EXISTS idx_ev${suffix}_site_ev_ts ON ${t}(site_id, event, ts)`,
     `CREATE INDEX IF NOT EXISTS idx_ev${suffix}_visitor ON ${t}(site_id, visitor_id)`,
-    `CREATE INDEX IF NOT EXISTS idx_ev${suffix}_session ON ${t}(session_id)`,
     `CREATE INDEX IF NOT EXISTS idx_ev${suffix}_verdict ON ${t}(site_id, verdict, ts)`,
     `CREATE INDEX IF NOT EXISTS idx_ev${suffix}_path    ON ${t}(site_id, path)`,
-    // crawler-category breakdown (0013)
-    `CREATE INDEX IF NOT EXISTS idx_ev${suffix}_botcat ON ${t}(site_id, bot_category, ts)`,
+    // idx_ev*_session and idx_ev*_botcat were dropped in migration 0022: no
+    // query uses them, and in D1 each index costs one row written per event.
   ];
+}
+
+/**
+ * Index-name suffixes RETIRED from the template (0022). The cron worker drops
+ * them from every existing partition hourly — the mirror image of the
+ * CREATE IF NOT EXISTS ensures above, so a partition created before the
+ * retirement can't keep paying a write per event for an index no query uses.
+ */
+export const EVENT_RETIRED_INDEXES = ['session', 'botcat'] as const;
+
+export function retiredIndexDropDDL(suffix: string): string[] {
+  return EVENT_RETIRED_INDEXES.map((k) => `DROP INDEX IF EXISTS idx_ev${suffix}_${k}`);
 }
 
 /**

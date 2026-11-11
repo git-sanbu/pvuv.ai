@@ -626,11 +626,14 @@ import type { XPayload } from '../../shared/flags';
 
   // -------------------------------------------------------------------------
   // periodic reporting (page_pulse): batched deltas on a visible-time backoff
-  // schedule — 15s, 30s, 60s, then every 120s — plus an immediate report when
+  // schedule — 15s, 45s, 120s, then every 300s — plus an immediate report when
   // the click buffer runs hot. Fires only when something new accumulated.
+  // Dwell is reported as DELTAS, so a longer cap only coarsens the crash-
+  // resilience granularity (worst case the dwell of the final ≤5min is lost
+  // with a silently-killed tab); totals and engagement are unaffected.
   // -------------------------------------------------------------------------
 
-  const PULSE_DELAYS = [15_000, 30_000, 60_000, 120_000];
+  const PULSE_DELAYS = [15_000, 45_000, 120_000, 300_000];
   let pulseStep = 0;
   let pulseTimer: ReturnType<typeof setTimeout> | null = null;
 

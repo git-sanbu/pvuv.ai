@@ -41,7 +41,7 @@ function localHour(ts: number, tz: string): number {
   }
 }
 import { FLAG, FAKE_SEARCH_MASK, searchRefDomainSql } from '../../../shared/flags';
-import { monthSuffix, eventsTableName, eventsIndexDDL, ensureEventColumns, RESERVED_EVENTS_SQL } from '../../../shared/events';
+import { monthSuffix, eventsTableName, eventsIndexDDL, retiredIndexDropDDL, ensureEventColumns, RESERVED_EVENTS_SQL } from '../../../shared/events';
 
 export async function runHourlyRollup(env: Env): Promise<void> {
   const now = Date.now();
@@ -82,16 +82,19 @@ export async function runHourlyRollup(env: Env): Promise<void> {
 
 /**
  * Keep every existing month partition structurally current — add columns and
- * indexes that later migrations introduced.
+ * indexes that later migrations introduced, and drop indexes later migrations
+ * retired (0022's session/botcat pair; every index costs a row written per
+ * event, and no query uses them).
  *
  * A migration can only name the partitions that existed when it was written,
  * and the consumer issues DDL only for the month it is actively writing, so
  * back-months would otherwise never gain anything added later (migration 0012's
  * index, 0013's bot_category column, and whatever comes next). Runs every hour
- * because it is cheap and fully idempotent: CREATE INDEX IF NOT EXISTS is a
- * no-op once present, and each ADD COLUMN is guarded by a PRAGMA check (SQLite
- * has no ADD COLUMN IF NOT EXISTS). Failures are logged, never fatal — a broken
- * partition must not stop the rollup for every site.
+ * because it is cheap and fully idempotent: CREATE INDEX IF NOT EXISTS /
+ * DROP INDEX IF EXISTS are no-ops once settled, and each ADD COLUMN is guarded
+ * by a PRAGMA check (SQLite has no ADD COLUMN IF NOT EXISTS). Failures are
+ * logged, never fatal — a broken partition must not stop the rollup for every
+ * site.
  */
 async function ensurePartitionSchema(env: Env, existing: Set<string>): Promise<void> {
   for (const table of existing) {
@@ -100,7 +103,10 @@ async function ensurePartitionSchema(env: Env, existing: Set<string>): Promise<v
       // same repair the consumer applies before writing (shared EVENT_LATE_COLUMNS),
       // so back-months nobody is currently writing to also stay current
       await ensureEventColumns(env.DB, suffix);
-      await env.DB.batch(eventsIndexDDL(suffix).map((sql) => env.DB.prepare(sql)));
+      await env.DB.batch([
+        ...eventsIndexDDL(suffix).map((sql) => env.DB.prepare(sql)),
+        ...retiredIndexDropDDL(suffix).map((sql) => env.DB.prepare(sql)),
+      ]);
     } catch (err) {
       console.error(`rollup: schema ensure failed for ${table}`, err);
     }
