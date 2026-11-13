@@ -10,6 +10,7 @@
 import { enrichEvent, parseUA, isChromiumUA, isHeadlessUA, hashIP, fingerprintHash, type RequestContext } from './enrich';
 import { scoreRealtime } from './score';
 import { classifyAsn } from '../../../shared/asn';
+import { packEvents, type QueuePayload } from '../../../shared/queue';
 import { matchBot, type BotEntry } from '../../../shared/botdir';
 import { hmacSign, signVerdictState, verifyVerdictState, type VerdictState } from '../../../shared/ids';
 import type { XPayload, Verdict } from '../../../shared/flags';
@@ -47,7 +48,7 @@ export interface Env {
   DB: D1Database;
   BLOCKLIST: KVNamespace;
   SITE_CONFIG: KVNamespace;
-  INGEST_QUEUE: Queue<EventRow>;
+  INGEST_QUEUE: Queue<QueuePayload>;
   /** Secret via `wrangler secret put HMAC_KEY` — never in any file. */
   HMAC_KEY: string;
   /** Optional (§12): shared secret with a first-party reverse proxy. When a
@@ -241,7 +242,7 @@ async function handleIngest(request: Request, env: Env, ctx: ExecutionContext): 
   if (rows.length === 0) return respond(204);
 
   try {
-    await env.INGEST_QUEUE.sendBatch(rows.map((body) => ({ body })));
+    await env.INGEST_QUEUE.sendBatch(packEvents(rows).map((body) => ({ body, contentType: 'json' })));
   } catch (err) {
     console.error('queue send failed', err);
     return respond(503);

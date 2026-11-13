@@ -7,25 +7,24 @@
  *
  * Exactly-once posture: event rows carry a stable `eid` and are written with
  * INSERT OR IGNORE against a UNIQUE index, so a Cloudflare Queues redelivery
- * (at-least-once) never duplicates an event row. All statements for one queue
- * batch go into a SINGLE atomic D1 batch() — no multi-chunk partial commits —
- * so a failure rolls the whole batch back and retryAll() re-runs it cleanly.
+ * (at-least-once) never duplicates an event row. Messages are grouped into at
+ * most 50 events per atomic D1 batch(); a message is never split between
+ * writes. Only messages in a failed group are retried.
  * The dashboard's core metrics (pv/uv/verdict/page/country/device) are
  * recomputed from the exactly-once events by the rollup, so they are correct
  * under redelivery. The sessions/visitor_profiles counters are additive; in
  * the rare case an ack is lost AFTER a successful commit they could over-count
  * on redelivery — a bounded residual, full session-table exactly-once is M2.
  *
- * Write amplification: a queue batch (≤50 events) holds whole pages of one
- * visitor (the SDK flushes a page's pv/pulse/leave together), so the
+ * Write amplification: an event group (≤50 events) can hold several events of one
+ * visitor, so the
  * session/identity/profile upserts are emitted ONE PER DISTINCT KEY PER
  * BATCH with folded counters — not one per event. The fold reproduces the
  * state the old per-event sequence would have left, including for a session
  * the batch itself creates (the INSERT side carries the folded totals). In
  * D1 each upserted row is a row written, so this is roughly −1.5 rows/event.
  *
- * Keep the queue's max_batch_size modest (see wrangler.toml) so one batch's
- * statements fit comfortably in a single D1 batch().
+ * The event-count limit also applies when one message contains several events.
  */
 
 import {
@@ -34,6 +33,7 @@ import {
 } from '../../../shared/events';
 import { classifyChannel } from '../../../shared/channel';
 import { SESSION_MAX_SPAN_MS } from '../../../shared/ids';
+import { CONSUMER_BATCH_EVENTS, unpackEvents } from '../../../shared/queue';
 
 export interface Env {
   DB: D1Database;
@@ -68,72 +68,86 @@ async function ensureThresholds(db: D1Database, siteIds: string[]): Promise<void
 
 export default {
   async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
-    const rows = batch.messages.map((m) => m.body).filter(isPlausibleRow);
-    if (rows.length === 0) {
-      batch.ackAll();
-      return;
+    let rows: EventRow[] = [];
+    let messages: Message<unknown>[] = [];
+    const flush = async (): Promise<void> => {
+      if (!messages.length) return;
+      try {
+        await writeRows(rows, env);
+        for (const message of messages) message.ack();
+      } catch (err) {
+        console.error('consumer batch failed', err);
+        for (const message of messages) message.retry();
+      }
+      rows = [];
+      messages = [];
+    };
+    for (const message of batch.messages) {
+      let events: EventRow[];
+      try {
+        events = unpackEvents(message.body);
+      } catch (err) {
+        console.error('consumer payload failed', err);
+        message.retry();
+        continue;
+      }
+      // Bound by EVENT count, not message count: packed messages must not
+      // multiply the size of the existing atomic D1 write. A committed group
+      // is acknowledged separately so a later failure won't replay it.
+      if (rows.length + events.length > CONSUMER_BATCH_EVENTS) await flush();
+      rows.push(...events);
+      messages.push(message);
     }
-
-    try {
-      // 1. ensure monthly partitions exist
-      const months = [...new Set(rows.map((r) => monthSuffix(r.ts)))];
-      for (const suffix of months) {
-        if (ensuredMonths.has(suffix)) continue;
-        await env.DB.batch(eventsTableDDL(suffix).map((sql) => env.DB.prepare(sql)));
-        // A table that already existed is NOT recreated by the IF NOT EXISTS
-        // above, so a month created before a later migration would still be
-        // missing that migration's columns and every insert would fail. Repair
-        // before writing — this runs once per isolate per month, so a deploy
-        // self-heals on its first batch instead of waiting for the hourly cron.
-        await ensureEventColumns(env.DB, suffix);
-        ensuredMonths.add(suffix);
-      }
-
-      // per-site engagement dwell thresholds (for is_bounce)
-      await ensureThresholds(env.DB, rows.map((r) => r.site_id));
-
-      // 2. ONE atomic D1 batch: event inserts (OR IGNORE) + session/identity/
-      //    profile upserts, ONE PER DISTINCT KEY (events of the same session
-      //    cluster inside a queue batch). All-or-nothing, so a retry can't
-      //    partial-commit.
-      //
-      //    ts-ordered once here: every fold below assumes the group is in
-      //    application order, matching the per-event sequence it replaces.
-      const ordered = [...rows].sort((a, b) => a.ts - b.ts);
-      const stmts: D1PreparedStatement[] = [];
-      for (const row of ordered) {
-        stmts.push(env.DB.prepare(eventInsertSQL(monthSuffix(row.ts))).bind(...bindable(eventRowValues(row))));
-      }
-      const sessionGroups = groupBy(ordered, (r) => `${r.site_id}|${r.session_id}`);
-      const visitorGroups = groupBy(ordered, (r) => `${r.site_id}|${r.visitor_id}`);
-      const identityGroups = groupBy(
-        ordered.filter((r) => r.user_id),
-        (r) => `${r.site_id}|${r.user_id}|${r.visitor_id}`,
-      );
-      for (const evs of sessionGroups.values()) {
-        stmts.push(sessionUpsert(env.DB, evs, siteEngagedMs.get(evs[0].site_id) ?? DEFAULT_ENGAGED_MS));
-      }
-      for (const evs of visitorGroups.values()) {
-        stmts.push(profileUpsert(env.DB, evs));
-      }
-      for (const evs of identityGroups.values()) {
-        stmts.push(identityUpsert(env.DB, evs));
-      }
-      await env.DB.batch(stmts);
-
-      batch.ackAll();
-    } catch (err) {
-      console.error('consumer batch failed', err);
-      batch.retryAll();
-    }
+    await flush();
   },
 } satisfies ExportedHandler<Env>;
 
-function isPlausibleRow(row: unknown): row is EventRow {
-  const r = row as EventRow;
-  return !!r && typeof r.site_id === 'string' && typeof r.event === 'string'
-    && typeof r.visitor_id === 'string' && typeof r.session_id === 'string'
-    && typeof r.ts === 'number';
+async function writeRows(rows: EventRow[], env: Env): Promise<void> {
+  // 1. ensure monthly partitions exist
+  const months = [...new Set(rows.map((r) => monthSuffix(r.ts)))];
+  for (const suffix of months) {
+    if (ensuredMonths.has(suffix)) continue;
+    await env.DB.batch(eventsTableDDL(suffix).map((sql) => env.DB.prepare(sql)));
+    // A table that already existed is NOT recreated by the IF NOT EXISTS
+    // above, so a month created before a later migration would still be
+    // missing that migration's columns and every insert would fail. Repair
+    // before writing — this runs once per isolate per month, so a deploy
+    // self-heals on its first batch instead of waiting for the hourly cron.
+    await ensureEventColumns(env.DB, suffix);
+    ensuredMonths.add(suffix);
+  }
+
+  // per-site engagement dwell thresholds (for is_bounce)
+  await ensureThresholds(env.DB, rows.map((r) => r.site_id));
+
+  // 2. ONE atomic D1 batch: event inserts (OR IGNORE) + session/identity/
+  //    profile upserts, ONE PER DISTINCT KEY (events of the same session
+  //    cluster inside a queue batch). All-or-nothing, so a retry can't
+  //    partial-commit.
+  //
+  //    ts-ordered once here: every fold below assumes the group is in
+  //    application order, matching the per-event sequence it replaces.
+  const ordered = [...rows].sort((a, b) => a.ts - b.ts);
+  const stmts: D1PreparedStatement[] = [];
+  for (const row of ordered) {
+    stmts.push(env.DB.prepare(eventInsertSQL(monthSuffix(row.ts))).bind(...bindable(eventRowValues(row))));
+  }
+  const sessionGroups = groupBy(ordered, (r) => `${r.site_id}|${r.session_id}`);
+  const visitorGroups = groupBy(ordered, (r) => `${r.site_id}|${r.visitor_id}`);
+  const identityGroups = groupBy(
+    ordered.filter((r) => r.user_id),
+    (r) => `${r.site_id}|${r.user_id}|${r.visitor_id}`,
+  );
+  for (const evs of sessionGroups.values()) {
+    stmts.push(sessionUpsert(env.DB, evs, siteEngagedMs.get(evs[0].site_id) ?? DEFAULT_ENGAGED_MS));
+  }
+  for (const evs of visitorGroups.values()) {
+    stmts.push(profileUpsert(env.DB, evs));
+  }
+  for (const evs of identityGroups.values()) {
+    stmts.push(identityUpsert(env.DB, evs));
+  }
+  await env.DB.batch(stmts);
 }
 
 /** D1 bind() rejects undefined — normalize to null. */
