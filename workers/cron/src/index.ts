@@ -36,6 +36,8 @@ const CRON_DAILY = '30 3 * * *';
 export interface Env {
   DB: D1Database;
   BLOCKLIST: KVNamespace;
+  /** Opt in to publishing KV blocklist entries; also enable on ingest. */
+  BLOCKLIST_ENABLED?: string;
 }
 
 export default {

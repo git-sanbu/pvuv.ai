@@ -143,11 +143,14 @@ export async function runDailyBatch(env: Env): Promise<void> {
   ));
   if (flagStmts.length) await db.batch(flagStmts);
 
-  for (const c of clusters) {
-    if (c.action !== 'block') continue;
-    const value = JSON.stringify({ cluster: c.id, members: c.members, at: nowTs });
-    if (c.fp) await env.BLOCKLIST.put(`bl:fp:${c.fp}`, value, { expirationTtl: ttlSec });
-    if (c.ip24 && !c.fp) await env.BLOCKLIST.put(`bl:ip24:${c.ip24}`, value, { expirationTtl: ttlSec });
+  // Pause KV publication without stopping analysis/evidence or batch scoring.
+  if (env.BLOCKLIST_ENABLED === 'true') {
+    for (const c of clusters) {
+      if (c.action !== 'block') continue;
+      const value = JSON.stringify({ cluster: c.id, members: c.members, at: nowTs });
+      if (c.fp) await env.BLOCKLIST.put(`bl:fp:${c.fp}`, value, { expirationTtl: ttlSec });
+      if (c.ip24 && !c.fp) await env.BLOCKLIST.put(`bl:ip24:${c.ip24}`, value, { expirationTtl: ttlSec });
+    }
   }
 
   // ---- 5. batch re-verdict of the window's events for blocking clusters ------

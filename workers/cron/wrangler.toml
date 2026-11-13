@@ -37,3 +37,6 @@ database_id = "PLACEHOLDER_D1_DATABASE_ID"
 
 [observability]
 enabled = true
+
+[vars]
+BLOCKLIST_ENABLED = "false"

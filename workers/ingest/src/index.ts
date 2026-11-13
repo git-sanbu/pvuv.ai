@@ -47,6 +47,8 @@ async function botDirectory(env: Env): Promise<BotEntry[]> {
 export interface Env {
   DB: D1Database;
   BLOCKLIST: KVNamespace;
+  /** Opt in to KV blocklist lookups; keep in sync with the cron worker. */
+  BLOCKLIST_ENABLED?: string;
   SITE_CONFIG: KVNamespace;
   INGEST_QUEUE: Queue<QueuePayload>;
   /** Secret via `wrangler secret put HMAC_KEY` — never in any file. */
@@ -85,8 +87,15 @@ function resolveClient(request: Request, env: Env): ClientCtx {
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_VERDICT_BYTES = 8 * 1024;
-/** KV cache TTL for site config (console write-through keeps it fresh). */
-const SITE_CACHE_TTL_S = 300;
+/** Console writes/deletes KV when configuration changes. */
+const SITE_CACHE_TTL_S = 86_400;
+/** Reuse site configuration across requests in this isolate. */
+const SITE_MEMORY_TTL_MS = 30 * 60_000;
+const SITE_MEMORY_MAX_ENTRIES = 1000;
+const siteConfigCache = new Map<string, {
+  value: Promise<SiteConfig | null>;
+  expiresAt: number;
+}>();
 /** Short negative-cache TTL so bogus site_ids don't re-hit D1 every request. */
 const SITE_MISS_TTL_S = 60;
 
@@ -209,7 +218,7 @@ async function handleIngest(request: Request, env: Env, ctx: ExecutionContext): 
   const fpForBlocklist = fpEvent
     ? await fingerprintHash(env.HMAC_KEY, fpEvent.x!.x7, reqCtx.ua, fpEvent.sw, fpEvent.sh, fpEvent.lang)
     : null;
-  const blocklisted = await isBlocklisted(env.BLOCKLIST, ip24_hash, fpForBlocklist);
+  const blocklisted = await isBlocklisted(env, ip24_hash, fpForBlocklist);
 
   // --- enrich + score each event ---
   const rows: EventRow[] = [];
@@ -314,7 +323,7 @@ async function handleVerdict(request: Request, env: Env): Promise<Response> {
   const fp = body.x?.x7
     ? await fingerprintHash(env.HMAC_KEY, body.x.x7, ua, body.sw, body.sh, body.lang)
     : null;
-  const blocklisted = await isBlocklisted(env.BLOCKLIST, ip24_hash, fp);
+  const blocklisted = await isBlocklisted(env, ip24_hash, fp);
 
   const interacted = body.i === 1 || prior?.i === 1;
   const scored = scoreRealtime({
@@ -391,6 +400,30 @@ export interface SiteConfig {
 
 async function getSiteConfig(env: Env, siteId: string): Promise<SiteConfig | null> {
   if (!/^[A-Za-z0-9]{4,16}$/.test(siteId)) return null;
+  const cached = siteConfigCache.get(siteId);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  // Share an in-flight lookup too, so concurrent requests don't all hit KV.
+  if (siteConfigCache.size >= SITE_MEMORY_MAX_ENTRIES) {
+    siteConfigCache.delete(siteConfigCache.keys().next().value!);
+  }
+  const entry = {
+    value: loadSiteConfig(env, siteId),
+    expiresAt: Date.now() + SITE_MEMORY_TTL_MS,
+  };
+  siteConfigCache.set(siteId, entry);
+  try {
+    const config = await entry.value;
+    entry.expiresAt = Date.now() + (config ? SITE_MEMORY_TTL_MS : SITE_MISS_TTL_S * 1000);
+    return config;
+  } catch (err) {
+    // A transient lookup failure must not stay cached for 30 minutes.
+    if (siteConfigCache.get(siteId) === entry) siteConfigCache.delete(siteId);
+    throw err;
+  }
+}
+
+async function loadSiteConfig(env: Env, siteId: string): Promise<SiteConfig | null> {
   const key = `site:${siteId}`;
 
   const cached = await env.SITE_CONFIG.get<SiteConfig & { __miss?: true }>(key, 'json');
@@ -506,7 +539,9 @@ function requestOriginHost(request: Request): string | null {
 // checked here so confirmed clusters affect realtime scoring immediately.
 // ---------------------------------------------------------------------------
 
-async function isBlocklisted(kv: KVNamespace, ip24: string | null, fp: string | null): Promise<boolean> {
+async function isBlocklisted(env: Env, ip24: string | null, fp: string | null): Promise<boolean> {
+  if (env.BLOCKLIST_ENABLED !== 'true') return false;
+  const kv = env.BLOCKLIST;
   const checks: Promise<string | null>[] = [];
   if (ip24) checks.push(kv.get(`bl:ip24:${ip24}`));
   if (fp) checks.push(kv.get(`bl:fp:${fp}`));
